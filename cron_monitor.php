@@ -10,8 +10,9 @@ error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
 // 1. 引入数据库配置文件 (获取 $pdo)
-require __DIR__ . '/db.php';
+require __DIR__ . '/db.php'; 
 date_default_timezone_set('PRC'); // 设置为中国时区
+$__ua_scene = (php_sapi_name() === 'cli') ? '定时任务' : '手动查询';
 // 2. 初始化 kf 库连接 (获取 $db，严格同步 index.php 逻辑)
 $db = new mysqli('localhost', 'kf', 'KF123456', 'kf');
 if ($db->connect_error) die("DB Connection Failed: " . $db->connect_error);
@@ -54,21 +55,9 @@ while ($task = $res->fetch_assoc()) {
     }
 
     // --- 抓取逻辑：严格复用原 payload ---
-    $stmt_cookie = $pdo->prepare("SELECT key_value FROM settings WHERE key_name = 'ua_cookie'");
-    $stmt_cookie->execute();
-    $userCookie = $stmt_cookie->fetchColumn() ?: '';
-
-    if (empty($userCookie)) {
-        echo "Cookie缺失，尝试重登... ";
-        sendCookieStatusLark_Cron($pdo, '⚠️ Cookie 缺失', '未读取到 Cookie，开始自动登录获取。');
-        $userCookie = autoLoginLeniu_Cron($pdo);
-        if ($userCookie) {
-            echo "重登成功 ";
-        } else {
-            echo "重登失败\n";
-            continue;
-        }
-    }
+    $userCookie = ua_ensure_cookie($pdo, $__ua_scene);
+    if (!$userCookie) { echo "错误：Cookie不可用（已通知飞书）
+"; continue; }
 
     $url = 'https://ad.leniugame.com/ServerDataMonitor/serverData';
     $ch = curl_init($url);
@@ -80,48 +69,27 @@ while ($task = $res->fetch_assoc()) {
         CURLOPT_TIMEOUT => 30,
         CURLOPT_HTTPHEADER => [
             'Cookie: ' . $userCookie,
-            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         ]
     ]);
     
     $resp = curl_exec($ch);
-    $curlErr = curl_error($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $data = json_decode($resp, true);
 
-    $dataValid = is_array($data) && isset($data['data']['rows']) && is_array($data['data']['rows']);
-
-    // 自动重登逻辑
-    if ($resp === false || $curlErr || $httpCode >= 400 || !$dataValid || (isset($data['code']) && $data['code'] == 1001)) {
-        $detail = "请求异常，HTTP={$httpCode}。";
-        if ($curlErr) {
-            $detail .= " cURL 错误: {$curlErr}。";
-        }
-        if (!$dataValid && $resp !== false) {
-            $detail .= "响应结构异常或未包含 rows。";
-        }
-        echo "Cookie失效，尝试重登... ";
-        sendCookieStatusLark_Cron($pdo, '⚠️ Cookie 失效', $detail . '开始自动登录获取。');
-        $newCookie = autoLoginLeniu_Cron($pdo);
+    // Cookie 失效判定：未登录/无权限(code=1001) 或返回非 JSON
+    if (!$data || (isset($data['code']) && (int)$data['code'] === 1001)) {
+        echo "Cookie失效，自动刷新... ";
+        $newCookie = ua_ensure_cookie($pdo, $__ua_scene);
         if ($newCookie) {
-            curl_setopt($ch, CURLOPT_HTTPHEADER, [
-                'Cookie: ' . $newCookie,
-                'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-            ]);
+            curl_setopt($ch, CURLOPT_HTTPHEADER, ['Cookie: ' . $newCookie, 'User-Agent: Mozilla/5.0']);
             $resp = curl_exec($ch);
-            $curlErr = curl_error($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             $data = json_decode($resp, true);
-            $dataValid = is_array($data) && isset($data['data']['rows']) && is_array($data['data']['rows']);
-            if ($resp === false || $curlErr || $httpCode >= 400 || !$dataValid) {
-                sendCookieStatusLark_Cron($pdo, '⚠️ Cookie 获取失败', '重登后接口响应仍异常，无法获取有效数据。');
-            }
-            echo "重登成功 ";
+            echo "刷新完成 ";
         } else {
-            echo "重登失败 ";
+            echo "刷新失败 ";
         }
     }
-    curl_close($ch);
+    curl_close($ch);($ch);
 
     // 数据解析
     $count = 0;
@@ -172,62 +140,3 @@ function sendLark_Cron($pdo, $game, $platform, $count, $threshold, $servers) {
     curl_exec($ch); curl_close($ch);
 }
 
-/** 辅助函数：Cookie 状态通知 **/
-function sendCookieStatusLark_Cron($pdo, $title, $detail) {
-    $stmt = $pdo->prepare("SELECT key_value FROM settings WHERE key_name = 'ua_webhook'");
-    $stmt->execute();
-    $webhook = $stmt->fetchColumn();
-    if (empty($webhook)) return;
-
-    $message = [
-        "msg_type" => "interactive",
-        "card" => [
-            "header" => ["title" => ["tag" => "plain_text", "content" => $title], "template" => "blue"],
-            "elements" => [
-                ["tag" => "div", "text" => ["tag" => "lark_md", "content" => $detail]]
-            ]
-        ]
-    ];
-    $ch = curl_init($webhook);
-    curl_setopt_array($ch, [CURLOPT_HTTPHEADER => ['Content-Type: application/json'], CURLOPT_POST => 1, CURLOPT_POSTFIELDS => json_encode($message), CURLOPT_RETURNTRANSFER => true, CURLOPT_SSL_VERIFYPEER => false]);
-    curl_exec($ch); curl_close($ch);
-}
-
-/** 辅助函数：重登逻辑 **/
-function autoLoginLeniu_Cron($pdo) {
-    $loginUrl = 'https://bloc.leniugame.com/Login/account';
-    $postData = 'ln_aaaaa=zhuizyan&ln_ddddd=5f05862b03f97c65b123b56f92d8a284d3e4971a82d4ee76baff98be6f0b1b83785cd91b6b0d9e92dcf7b8c9e71cbf9b2a6bf303fc82ab634473c6bc6c766f7f3eca9ccf5a759fb7971486299fc45cd6c2dd6ff35b45e1100c2c7a18cdd75b89a70163bbd037f48a8ab4c7e15afe591908e401a27910912292f91a5b3fffe808&user_name=&code=&codeType=1&__hash__=67cd93aa40c81b1e2eb4059182c172af_2c239120b8a73d3edbc74d6a20460dd6';
-    $ch = curl_init($loginUrl);
-    curl_setopt_array($ch, [
-        CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => $postData,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HEADER => true,
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_TIMEOUT => 30,
-        CURLOPT_HTTPHEADER => [
-            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Referer: https://bloc.leniugame.com/'
-        ]
-    ]);
-    $response = curl_exec($ch);
-    if ($response === false) {
-        sendCookieStatusLark_Cron($pdo, '⚠️ Cookie 获取失败', '登录请求失败，无法获取 Cookie。');
-        curl_close($ch);
-        return false;
-    }
-    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-    $header = substr($response, 0, $headerSize);
-    curl_close($ch);
-    preg_match_all('/Set-Cookie: (.*?);/i', $header, $matches);
-    if (!empty($matches[1])) {
-        $newCookie = implode('; ', array_unique($matches[1]));
-        $stmt = $pdo->prepare("REPLACE INTO settings (key_name, key_value) VALUES ('ua_cookie', ?)");
-        $stmt->execute([$newCookie]);
-        sendCookieStatusLark_Cron($pdo, '✅ Cookie 获取成功', '已自动更新 Cookie 并写入数据库。');
-        return $newCookie;
-    }
-    sendCookieStatusLark_Cron($pdo, '⚠️ Cookie 获取失败', '登录成功但未获取到 Set-Cookie。');
-    return false;
-}
