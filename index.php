@@ -7,7 +7,7 @@ date_default_timezone_set('PRC'); // 设置为中国时区
 // 权限拦截
 $user_perms = json_decode($_SESSION['user']['permissions'] ?? '[]', true);
 if (!isset($_SESSION['user']) || ($_SESSION['user']['role'] !== 'admin' && !in_array('kf', $user_perms))) {
-    die("无权访问。 <a href='http://192.168.10.124/auth.php'>前往登录</a>");
+    die("无权访问。 <a href='https://www.zzyceshi.work/'>前往登录</a>");
 }
 
 // 连接本地 kf 库
@@ -53,9 +53,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $game = trim($_POST['game'] ?? '');
         $platform = trim($_POST['platform'] ?? '');
         
-        $stmt_cookie = $pdo->prepare("SELECT key_value FROM settings WHERE key_name = 'ua_cookie'");
-        $stmt_cookie->execute();
-        $userCookie = $stmt_cookie->fetchColumn() ?: '';
+        $userCookie = ua_load_cookie($pdo);
 
         if (empty($game) || empty($platform)) {
             echo json_encode(['success' => false, 'error' => '参数不完整']); exit;
@@ -101,23 +99,113 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         echo json_encode(['success' => true]); exit;
     }
 }
-function autoLoginLeniu($pdo) {
+// === UA Cookie helpers (leniu) ===
+function ua_cookie_file_path(): string {
+    return __DIR__ . '/ua_cookie.txt';
+}
+
+function leniu_cookie_has_auth(string $cookie): bool {
+    return (strpos($cookie, 'ln_auth=') !== false) && (strpos($cookie, 'ln_auth_id=') !== false);
+}
+
+function ua_load_cookie($pdo): string {
+    $cookie = '';
+    try {
+        $stmt = $pdo->prepare("SELECT key_value FROM settings WHERE key_name = 'ua_cookie'");
+        $stmt->execute();
+        $cookie = trim((string)($stmt->fetchColumn() ?: ''));
+    } catch (\Throwable $e) {
+        $cookie = '';
+    }
+    if ($cookie && leniu_cookie_has_auth($cookie)) return $cookie;
+
+    $file = ua_cookie_file_path();
+    if (is_readable($file)) {
+        $fileCookie = trim((string)file_get_contents($file));
+        if ($fileCookie && leniu_cookie_has_auth($fileCookie)) return $fileCookie;
+    }
+    return $cookie; // 可能为空或不完整
+}
+
+function ua_save_cookie($pdo, string $cookie): void {
+    // 永远保存一份到本地文件，避免 DB 字段过短导致截断
+    @file_put_contents(ua_cookie_file_path(), $cookie);
+
+    // 尝试保存到数据库（若字段长度不够会被截断，代码会在后续校验发现）
+    try {
+        $pdo->prepare("REPLACE INTO settings (key_name, key_value) VALUES ('ua_cookie', ?)")->execute([$cookie]);
+    } catch (\Throwable $e) {
+        // 忽略 DB 错误，至少文件里有
+    }
+}
+
+function leniu_fetch_cookie(string $loginUrl, string $postData): string|false {
+    $tmp = tempnam(sys_get_temp_dir(), 'leniu_cookie_');
+    if ($tmp === false) return false;
+
+    $ch = curl_init($loginUrl);
+    curl_setopt_array($ch, [
+        CURLOPT_POST            => true,
+        CURLOPT_POSTFIELDS      => $postData,
+        CURLOPT_RETURNTRANSFER  => true,
+        CURLOPT_FOLLOWLOCATION  => true,
+        CURLOPT_MAXREDIRS       => 10,
+        CURLOPT_SSL_VERIFYPEER  => false,
+        CURLOPT_SSL_VERIFYHOST  => false,
+        CURLOPT_CONNECTTIMEOUT  => 10,
+        CURLOPT_TIMEOUT         => 25,
+        CURLOPT_ENCODING        => '',
+        CURLOPT_COOKIEJAR       => $tmp,
+        CURLOPT_COOKIEFILE      => $tmp,
+        CURLOPT_HTTPHEADER      => [
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept: */*',
+            'Referer: https://bloc.leniugame.com/',
+        ],
+    ]);
+
+    curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err = curl_error($ch);
+    curl_close($ch);
+
+    $cookiePairs = [];
+    if (is_readable($tmp)) {
+        $lines = file($tmp, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+        foreach ($lines as $line) {
+            if ($line === '' || $line[0] === '#') continue;
+            $parts = explode("\t", $line);
+            // Netscape cookie file format: domain, flag, path, secure, expiration, name, value
+            if (count($parts) >= 7) {
+                $name = $parts[5];
+                $value = $parts[6];
+                if ($name !== '') $cookiePairs[$name] = $value;
+            }
+        }
+    }
+    @unlink($tmp);
+
+    if ($err || $httpCode < 200 || $httpCode >= 400) return false;
+    if (!$cookiePairs) return false;
+
+    $cookie = implode('; ', array_map(fn($k,$v)=>$k.'='.$v, array_keys($cookiePairs), array_values($cookiePairs)));
+    return $cookie ?: false;
+}
+
+function autoLoginLeniu($pdo): string|false {
     $loginUrl = 'https://bloc.leniugame.com/Login/account';
     $postData = 'ln_aaaaa=zhuizyan&ln_ddddd=5f05862b03f97c65b123b56f92d8a284d3e4971a82d4ee76baff98be6f0b1b83785cd91b6b0d9e92dcf7b8c9e71cbf9b2a6bf303fc82ab634473c6bc6c766f7f3eca9ccf5a759fb7971486299fc45cd6c2dd6ff35b45e1100c2c7a18cdd75b89a70163bbd037f48a8ab4c7e15afe591908e401a27910912292f91a5b3fffe808&user_name=&code=&codeType=1&__hash__=67cd93aa40c81b1e2eb4059182c172af_2c239120b8a73d3edbc74d6a20460dd6';
-    $ch = curl_init($loginUrl);
-    curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $postData, CURLOPT_RETURNTRANSFER => true, CURLOPT_HEADER => true, CURLOPT_SSL_VERIFYPEER => false]);
-    $response = curl_exec($ch);
-    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-    $header = substr($response, 0, $headerSize);
-    curl_close($ch);
-    preg_match_all('/Set-Cookie: (.*?);/i', $header, $matches);
-    if (!empty($matches[1])) {
-        $newCookie = implode('; ', array_unique($matches[1]));
-        $pdo->prepare("REPLACE INTO settings (key_name, key_value) VALUES ('ua_cookie', ?)")->execute([$newCookie]);
-        return $newCookie;
-    }
-    return false;
+
+    $newCookie = leniu_fetch_cookie($loginUrl, $postData);
+    if (!$newCookie) return false;
+
+    // 关键：没有 ln_auth/ln_auth_id 视为未登录成功（常见原因：需要验证码/参数失效）
+    if (!leniu_cookie_has_auth($newCookie)) return false;
+
+    ua_save_cookie($pdo, $newCookie);
+    return $newCookie;
 }
+
 ?>
 <!DOCTYPE html>
 <html lang="zh-CN">
